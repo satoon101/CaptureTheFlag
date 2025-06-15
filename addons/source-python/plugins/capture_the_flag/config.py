@@ -30,7 +30,7 @@ __all__ = (
 # >> CONFIGURATION
 # ==============================================================================
 # Create the capture_the_flag.cfg file and execute it upon __exit__
-with ConfigManager(info.name, "ctf_") as config:
+with ConfigManager(f"{info.name}/config", "ctf_") as config:
     drop_command = config.cvar(
         name="drop_command",
         default="",

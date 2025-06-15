@@ -1,6 +1,6 @@
 # ../capture_the_flag/capture_the_flag.py
 
-"""."""
+"""Plugin to provide Capture the Flag gameplay."""
 
 # ==============================================================================
 # >> IMPORTS
@@ -12,19 +12,21 @@ from enum import IntEnum
 from colors import BLUE, RED, WHITE
 from commands.client import ClientCommand
 from commands.say import SayCommand
+from cvars.tags import sv_tags
 from engines.precache import Model
 from engines.server import global_vars
 from engines.sound import Sound
-from entities.constants import SolidType
+from entities.constants import CollisionGroup, SolidType
 from entities.entity import Entity
 from entities.helpers import index_from_pointer
 from entities.hooks import EntityCondition, EntityPreHook, EntityPostHook
 from events import Event
 from filters.entities import EntityIter
 from listeners import OnLevelInit
+from listeners.tick import Repeat
 from mathlib import Vector
 from memory.hooks import use_pre_registers
-from messages import SayText2
+from messages import HudMsg, SayText2
 from players.entity import Player
 from players.helpers import index_from_userid, userid_from_index
 from players.teams import teams_by_name, team_managers
@@ -37,6 +39,7 @@ from .custom_events import (
     Flag_Returned,
     Flag_Taken,
 )
+from .info import info
 from .strings import MESSAGE_STRINGS
 
 
@@ -48,26 +51,18 @@ _start_touch_dict = {}
 FLAG_MODEL = Model("models/props/cs_militia/caseofbeer01.mdl")
 TEAM_COLORS = {
     2: {
-        "name": "Red",
-        "value": RED,
+        "message": f"{RED}Red\x01",
+        "color": RED,
     },
     3: {
-        "name": "Blue",
-        "value": BLUE,
+        "message": f"{BLUE}Blue\x01",
+        "color": BLUE,
     },
 }
-TEAM_SOUNDS = {}
-for _team_index, _color in ((2, "red"), (3, "blue")):
-    current = TEAM_SOUNDS[_team_index] = {}
-    for _event in ("dropped", "returned", "taken"):
-        current[f"flag_{_event}"] = Sound(
-            f"source-python/capture_the_flag/{_color}_flag_{_event}.mp3",
-            download=True,
-        )
 
 
 # ==============================================================================
-# >> CLASSES
+# >> ENUMS
 # ==============================================================================
 class FlagState(IntEnum):
     HOME = 0
@@ -75,25 +70,68 @@ class FlagState(IntEnum):
     DROPPED = 2
 
 
+class FlagTeam(IntEnum):
+    RED = 2
+    BLUE = 3
+
+
+# ==============================================================================
+# >> SOUNDS
+# ==============================================================================
+TEAM_SOUNDS = {}
+for _team in FlagTeam:
+    current = TEAM_SOUNDS[_team] = {}
+    for _event in ("dropped", "returned", "taken"):
+        current[f"flag_{_event}"] = Sound(
+            f"source-python/{info.name}/{_team.name.lower()}_flag_{_event}.mp3",
+            download=True,
+        )
+    for _item in (
+        "dominating",
+        "increase",
+        "scores",
+        "takes",
+        "wins_match",
+    ):
+        current[_item] = Sound(
+            f"source-python/{info.name}/{_team.name.lower()}_{_item}.mp3",
+            download=True,
+        )
+
+
+# ==============================================================================
+# >> CLASSES
+# ==============================================================================
 class Flag:
     entity = None
     state = FlagState.HOME
     carrier = None
+    collision_group = None
 
     def __init__(self, team_index, origin):
         self.team_index = team_index
         self.start_origin = origin
 
-    def create(self, origin=None):
-        origin = origin or self.start_origin
+    def create(self, location=None):
+        origin = location if location is not None else self.start_origin
         self.entity = Entity.create("prop_dynamic")
         ctf.indexes.add(self.entity.index)
         self.entity.model = FLAG_MODEL
-        self.entity.color = TEAM_COLORS[self.team_index]["value"]
+        self.entity.color = TEAM_COLORS[self.team_index]["color"]
         self.entity.solid_type = SolidType.VPHYSICS
-        self.entity.teleport(origin)
+        self.collision_group = self.entity.collision_group
+        self.entity.collision_group = CollisionGroup.PUSHAWAY
+        self.entity.teleport(origin=origin)
         self.entity.spawn()
+        self.entity.delay(0.2, self.set_entity_collision_group)
         return self
+
+    def set_entity_collision_group(self):
+        if self.collision_group is None:
+            return
+
+        self.entity.collision_group = self.collision_group
+        self.collision_group = None
 
     def take_flag(self, index):
         self.carrier = index
@@ -101,16 +139,17 @@ class Flag:
         ctf.indexes.remove(self.entity.index)
         self.entity.remove()
         self.entity = None
-        player.color = TEAM_COLORS[self.team_index]["value"]
+        player.color = TEAM_COLORS[self.team_index]["color"]
         self.state = FlagState.TAKEN
         with Flag_Taken() as event:
             event.userid = player.userid
             event.flag_team = self.team_index
 
-    def drop_flag(self, player, attacker=0, location=None):
-        location = location or player.origin
-        self.create(origin=location)
+    def drop_flag(self, player, attacker=0):
+        location = player.origin
+        self.create(location=location)
         self.state = FlagState.DROPPED
+        self.carrier = None
         with Flag_Dropped() as event:
             event.userid = player.userid
             event.attacker = attacker
@@ -139,10 +178,7 @@ class Flag:
 
 class CaptureTheFlag(dict):
     indexes = set()
-    scores = {
-        2: 0,
-        3: 0,
-    }
+    scores = {i.value: 0 for i in FlagTeam}
 
     def clear(self):
         self.indexes.clear()
@@ -181,7 +217,7 @@ class CaptureTheFlag(dict):
                 return flag
         return None
 
-    def drop_flag(self, index, use_player_location=True):
+    def drop_flag(self, index, attacker=0):
         player = Player(index)
         flag = self.get(5 - player.team_index)
         if flag is None:
@@ -190,14 +226,22 @@ class CaptureTheFlag(dict):
         if player.index != flag.carrier:
             return
 
-        location = player.origin
-        if not use_player_location:
-            # TODO: fix this
-            location = player.origin
-        flag.drop_flag(player, location=location)
+        flag.drop_flag(player, attacker=attacker)
 
 
 ctf = CaptureTheFlag()
+
+
+# ==============================================================================
+# >> LOAD & UNLOAD
+# ==============================================================================
+def load():
+    sv_tags.add("ctf")
+    ctf.create_flags()
+
+
+def unload():
+    sv_tags.remove("ctf")
 
 
 # ==============================================================================
@@ -208,17 +252,14 @@ if _drop_command:
     @SayCommand(_drop_command)
     @ClientCommand(_drop_command)
     def drop(command, index, teamonly=None):
-        ctf.drop_flag(
-            index=index,
-            use_player_location=False,
-        )
+        ctf.drop_flag(index=index)
 
 
 # ==============================================================================
 # >> LISTENERS
 # ==============================================================================
 @OnLevelInit
-def load(map_name=None):
+def _level_init(map_name):
     """Reset the cash dictionary."""
     ctf.create_flags()
 
@@ -263,7 +304,10 @@ def post_start_touch(stack_data, return_value):
 
     team_index = touching_entity.team_index
     # did the player take the flag?
-    if flag.state is FlagState.HOME and flag.team_index != team_index:
+    if (
+        flag.state in (FlagState.HOME, FlagState.DROPPED)
+        and flag.team_index != team_index
+    ):
         flag.take_flag(touching_entity.index)
         return
 
@@ -289,12 +333,14 @@ def post_start_touch(stack_data, return_value):
 def player_death(game_event):
     ctf.drop_flag(
         index=index_from_userid(game_event["userid"]),
+        attacker=game_event["attacker"],
     )
 
 
 @Event("flag_captured")
 def _flag_captured(game_event):
     team_index = int(game_event["team"])
+    sounds = TEAM_SOUNDS[team_index]
     # TODO: sounds and messages
     #       takes lead
     #       increases lead
@@ -303,8 +349,22 @@ def _flag_captured(game_event):
     ctf.scores[team_index] += 1
     set_team_scores()
     if ctf.scores[team_index] >= int(win_count):
+        sounds["wins_match"].play()
         entity = Entity.find_or_create("game_end")
-        entity.end_game()
+        return entity.end_game()
+
+    score = ctf.scores[team_index]
+    other_score = ctf.scores[5 - team_index]
+    if score <= other_score:
+        return sounds["scores"].play()
+
+    if score == other_score + 1:
+        return sounds["takes"].play()
+
+    if score >= other_score + 5:
+        return sounds["dominating"].play()
+
+    return sounds["increase"].play()
 
 
 @Event("flag_dropped")
@@ -320,7 +380,7 @@ def _flag_event(game_event):
         index=player.index,
     ).send(
         name=player.name,
-        team=TEAM_COLORS[team_index]["name"],
+        team=TEAM_COLORS[team_index]["message"],
     )
 
 
@@ -333,3 +393,34 @@ def set_team_scores(game_event=None):
             if entity.team not in ctf.scores:
                 continue
             entity.score = ctf.scores[entity.team]
+
+
+# ==============================================================================
+# >> REPEATS
+# ==============================================================================
+@Repeat
+def repeat_flag_stat_display():
+    if not ctf:
+        return
+
+    for team, y, channel in (
+        (2, -0.7, 10),
+        (3, -0.75, 11),
+    ):
+        HudMsg(
+            message=MESSAGE_STRINGS["flag_state"],
+            color1=TEAM_COLORS[team]["color"].with_alpha(255),
+            x=1.5,
+            y=y,
+            effect=0,
+            fade_in=0,
+            fade_out=0,
+            hold_time=2,
+            fx_time=0,
+            channel=channel,
+        ).send(
+            team=FlagTeam(team).name,
+            state=ctf[team].state.name,
+        )
+
+repeat_flag_stat_display.start(1.0)
